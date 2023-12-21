@@ -1,10 +1,11 @@
 # wordpress-rest-enum.py
-import sys
+
 import requests
 import json
 import argparse
 import logging
 import urllib3
+
 
 urllib3.disable_warnings()
 
@@ -25,6 +26,38 @@ logging.basicConfig(level=cliArgs.log_level)
 
 # Globals
 HEADERS = {'User-Agent': 'WordPress Testing'}
+
+
+def requestRESTAPIComments(website: str, fetchPage: int) -> json:
+    perPage = 100
+    apiRequest = f'{website}/wp-json/wp/v2/comments?per_page={perPage}&page={str(fetchPage)}'
+    results = []
+    try:
+        with requests.Session() as s:
+            download = s.get(apiRequest, headers=HEADERS, verify=False)
+            if download.status_code == 200:
+                # WordPress API returns mixed HTML and JSON in the users API endpoint.
+                # Remove all content to the first `[` indicating the beginning of JSON data.
+                content = '[' + '['.join(download.text.split('[')[1:])
+                comments = json.loads(content)
+                for comment in comments:
+                    try:
+                        newComment = {"name": comment['author_name'], "date":
+                                      comment['date'], "link": comment['link']}
+                        results.append(newComment)
+                    except Exception as err:
+                        print(f"Unexpected {err=}, {type(err)=}")
+                        raise
+                fetchPage = fetchPage + 1
+                if len(comments) > 0:
+                    results += requestRESTAPIComments(website, fetchPage)
+    except json.JSONDecodeError as e:
+        pass
+    except urllib3.exceptions.MaxRetryError as e:
+        pass  # Silently fail and do nothing
+    except requests.exceptions.ConnectionError as e:
+        pass  # Silently fail and do nothing
+    return results
 
 
 def requestRESTAPIUsers(website: str, fetchPage: int) -> json:
@@ -58,6 +91,7 @@ def requestRESTAPIUsers(website: str, fetchPage: int) -> json:
 
 def requestRESTAPI(type: str, website: str, fetchPage: int) -> list:
     perPage = 100
+
     try:
         apiRequest = f'{website}/wp-json/wp/v2/{type}?per_page={perPage}&page={str(fetchPage)}'
         results = []
@@ -95,7 +129,7 @@ def main():
     if cliArgs.pages:
         result["pages"] = requestRESTAPI("pages", website, fetchPage)
     if cliArgs.comments:
-        result["comments"] = requestRESTAPI("comments", website, fetchPage)
+        result["comments"] = requestRESTAPIComments(website, fetchPage)
     if cliArgs.media:
         result["media"] = requestRESTAPI("media", website, fetchPage)
     if cliArgs.users:
