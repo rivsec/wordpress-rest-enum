@@ -7,4 +7,4 @@ A WordPress rest-enumeration script
 `pip install -r requirements.txt`
 
 # Usage
-Enumerate users and media files: `python .\wordpress-rest-enum -w targetwebsite.com -u -m `
+Enumerate users and media files: `python ./wordpress-rest-enum.py -w https://targetwebsite.com -u -m `
