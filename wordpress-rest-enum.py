@@ -28,13 +28,13 @@ logging.basicConfig(level=cliArgs.log_level)
 HEADERS = {'User-Agent': 'WordPress Testing'}
 
 
-def requestRESTAPIComments(website: str, fetchPage: int) -> json:
+def requestRESTAPIComments(website: str, fetchPage: int, timeout=10) -> json:
     perPage = 100
     apiRequest = f'{website}/wp-json/wp/v2/comments?per_page={perPage}&page={str(fetchPage)}'
     results = []
     try:
         with requests.Session() as s:
-            download = s.get(apiRequest, headers=HEADERS, verify=False)
+            download = s.get(apiRequest, headers=HEADERS, verify=False, timeout=timeout)
             if download.status_code == 200:
                 # WordPress API returns mixed HTML and JSON in the users API endpoint.
                 # Remove all content to the first `[` indicating the beginning of JSON data.
@@ -60,13 +60,13 @@ def requestRESTAPIComments(website: str, fetchPage: int) -> json:
     return results
 
 
-def requestRESTAPIUsers(website: str, fetchPage: int) -> json:
+def requestRESTAPIUsers(website: str, fetchPage: int, timeout=10) -> json:
     perPage = 100
     apiRequest = f'{website}/wp-json/wp/v2/users?per_page={perPage}&page={str(fetchPage)}'
     results = []
     try:
         with requests.Session() as s:
-            download = s.get(apiRequest, headers=HEADERS, verify=False)
+            download = s.get(apiRequest, headers=HEADERS, verify=False, timeout=timeout)
             if download.status_code == 200:
                 content = download.text
                 users = json.loads(content)
@@ -89,14 +89,14 @@ def requestRESTAPIUsers(website: str, fetchPage: int) -> json:
     return results
 
 
-def requestRESTAPI(type: str, website: str, fetchPage: int) -> list:
+def requestRESTAPI(type: str, website: str, fetchPage: int, timeout=10) -> list:
     perPage = 100
 
     try:
         apiRequest = f'{website}/wp-json/wp/v2/{type}?per_page={perPage}&page={str(fetchPage)}'
         results = []
         with requests.Session() as s:
-            download = s.get(apiRequest, headers=HEADERS, verify=False)
+            download = s.get(apiRequest, headers=HEADERS, verify=False, timeout=timeout)
             if download.status_code == 200:
                 content = download.text
                 if content is not None:
