@@ -5,7 +5,7 @@ import json
 import argparse
 import logging
 import urllib3
-
+import re
 
 urllib3.disable_warnings()
 
@@ -18,6 +18,13 @@ parser.add_argument("-po", "--posts", help="Fetch posts", action=argparse.Boolea
 parser.add_argument("-pa", "--pages", help="Fetch pages", action=argparse.BooleanOptionalAction, required=False)
 parser.add_argument("-u", "--users", help="Fetch users", action=argparse.BooleanOptionalAction, required=False)
 parser.add_argument("-c", "--comments", help="Fetch comments", action=argparse.BooleanOptionalAction, required=False)
+parser.add_argument(
+    "-im",
+    "--ignoreImages",
+    help="Filter out extensions commonly associated with images and video",
+    action=argparse.BooleanOptionalAction,
+    required=False,
+)
 
 cliArgs = parser.parse_args()
 
@@ -42,8 +49,7 @@ def requestRESTAPIComments(website: str, fetchPage: int, timeout=10) -> json:
                 comments = json.loads(content)
                 for comment in comments:
                     try:
-                        newComment = {"name": comment['author_name'], "date":
-                                      comment['date'], "link": comment['link']}
+                        newComment = {"name": comment['author_name'], "date": comment['date'], "link": comment['link']}
                         results.append(newComment)
                     except Exception as err:
                         print(f"Unexpected {err=}, {type(err)=}")
@@ -132,6 +138,14 @@ def main():
         result["comments"] = requestRESTAPIComments(website, fetchPage)
     if cliArgs.media:
         result["media"] = requestRESTAPI("media", website, fetchPage)
+        if cliArgs.ignoreImages:
+            # result["media"]
+            # png | jpg | gif | svg | jpeg |
+            newMedia = []
+            for url in result['media']:
+                if not re.search(r'\.(jpg|gif|jpeg|png|svg|tiff|webm|webp)$', url, flags=re.IGNORECASE):
+                    newMedia.append(url)
+            result["media"] = newMedia
     if cliArgs.users:
         result["users"] = requestRESTAPIUsers(website, fetchPage)
     print(json.dumps(result))
