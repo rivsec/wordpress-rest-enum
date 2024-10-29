@@ -16,7 +16,9 @@ group = parser.add_mutually_exclusive_group(required=True)
 group.add_argument("-w", "--website", help="Website to check.", action='store', type=str)
 group.add_argument("-i", "--input-file", help="Input file containing list of websites", type=str)
 parser.add_argument_group(group)
-parser.add_argument("--log-level", default=logging.INFO, type=lambda x: getattr(logging, x), help="Configure the logging level.")
+parser.add_argument(
+    "--log-level", default=logging.WARNING, type=lambda x: getattr(logging, x), help="Configure the logging level."
+)
 parser.add_argument("-m", "--media", help="Fetch media", action=argparse.BooleanOptionalAction, required=False)
 parser.add_argument("-po", "--posts", help="Fetch posts", action=argparse.BooleanOptionalAction, required=False)
 parser.add_argument("-pa", "--pages", help="Fetch pages", action=argparse.BooleanOptionalAction, required=False)
@@ -155,12 +157,20 @@ def main():
     cnt = 0
     for website in websites:
         result = {}
+        result["website"] = website
+        found = False
         if cliArgs.posts:
             result["posts"] = requestRESTAPI("posts", website, fetchPage)
+            if len(result["posts"]) > 0:
+                found = True
         if cliArgs.pages:
             result["pages"] = requestRESTAPI("pages", website, fetchPage)
+            if len(result["pages"]) > 0:
+                found = True
         if cliArgs.comments:
             result["comments"] = requestRESTAPIComments(website, fetchPage)
+            if len(result["comments"]) > 0:
+                found = True
         if cliArgs.media:
             result["media"] = requestRESTAPI("media", website, fetchPage)
             if cliArgs.ignoreImages:
@@ -171,13 +181,16 @@ def main():
                 result["media"] = newMedia
         if cliArgs.users:
             result["users"] = requestRESTAPIUsers(website, fetchPage)
-        if cliArgs.output_file:
-            with open(cliArgs.output_file, 'a') as f:
-                if cnt > 0:
-                    f.write("\n")
-                f.write(json.dumps(result))
+        if not found:
+            logging.info(json.dumps({"message": "no results", "target": website}))
         else:
-            print(json.dumps(result))
+            if cliArgs.output_file:
+                with open(cliArgs.output_file, 'a') as f:
+                    if cnt > 0:
+                        f.write("\n")
+                    f.write(json.dumps(result))
+            else:
+                print(json.dumps(result))
         cnt += 1
 
 
