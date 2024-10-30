@@ -16,9 +16,7 @@ group = parser.add_mutually_exclusive_group(required=True)
 group.add_argument("-w", "--website", help="Website to check.", action='store', type=str)
 group.add_argument("-i", "--input-file", help="Input file containing list of websites", type=str)
 parser.add_argument_group(group)
-parser.add_argument(
-    "--log-level", default=logging.WARNING, type=lambda x: getattr(logging, x), help="Configure the logging level."
-)
+parser.add_argument("--log-level", default=logging.ERROR, type=lambda x: getattr(logging, x), help="Configure the logging level.")
 parser.add_argument("-m", "--media", help="Fetch media", action=argparse.BooleanOptionalAction, required=False)
 parser.add_argument("-po", "--posts", help="Fetch posts", action=argparse.BooleanOptionalAction, required=False)
 parser.add_argument("-pa", "--pages", help="Fetch pages", action=argparse.BooleanOptionalAction, required=False)
@@ -64,14 +62,9 @@ def requestRESTAPIComments(website: str, fetchPage: int, timeout=10) -> json:
                 fetchPage = fetchPage + 1
                 if len(comments) > 0:
                     results += requestRESTAPIComments(website, fetchPage)
-    except json.JSONDecodeError as e:
-        pass
-    except urllib3.exceptions.MaxRetryError as e:
-        pass  # Silently fail and do nothing
-    except requests.exceptions.ConnectionError as e:
-        pass  # Silently fail and do nothing
     except:
-        pass  # Silently fail and do nothing
+        raise
+
     return results
 
 
@@ -95,16 +88,9 @@ def requestRESTAPIUsers(website: str, fetchPage: int, timeout=10) -> json:
                 fetchPage = fetchPage + 1
                 if len(users) > 0:
                     results += requestRESTAPIUsers(website, fetchPage)
-    except json.JSONDecodeError as e:
-        pass
-    except urllib3.exceptions.MaxRetryError as e:
-        pass  # Silently fail and do nothing
-    except requests.exceptions.ConnectionError as e:
-        pass  # Silently fail and do nothing
-    except requests.exceptions.InvalidSchema as e:
-        pass  # Silently fail and do nothing
-    except urllib3.exceptions.ReadTimeoutError as e:
-        pass
+
+    except:
+        raise
     return results
 
 
@@ -129,16 +115,9 @@ def requestRESTAPI(type: str, website: str, fetchPage: int, timeout=10) -> list:
                     fetchPage = fetchPage + 1
                     if len(apiResponse) > 0:
                         results += requestRESTAPI(type, website, fetchPage)
-    except json.JSONDecodeError as e:
-        pass
-    except urllib3.exceptions.MaxRetryError as e:
-        pass  # Silently fail and do nothing
-    except requests.exceptions.ConnectionError as e:
-        pass  # Silently fail and do nothing
-    except requests.exceptions.InvalidSchema as e:
-        pass
-    except urllib3.exceptions.ReadTimeoutError as e:
-        pass
+    except:
+        raise
+
     return results
 
 
@@ -155,43 +134,56 @@ def main():
     fetchPage = 1
 
     cnt = 0
-    for website in websites:
-        result = {}
-        result["website"] = website
-        found = False
-        if cliArgs.posts:
-            result["posts"] = requestRESTAPI("posts", website, fetchPage)
-            if len(result["posts"]) > 0:
-                found = True
-        if cliArgs.pages:
-            result["pages"] = requestRESTAPI("pages", website, fetchPage)
-            if len(result["pages"]) > 0:
-                found = True
-        if cliArgs.comments:
-            result["comments"] = requestRESTAPIComments(website, fetchPage)
-            if len(result["comments"]) > 0:
-                found = True
-        if cliArgs.media:
-            result["media"] = requestRESTAPI("media", website, fetchPage)
-            if cliArgs.ignoreImages:
-                newMedia = []
-                for url in result['media']:
-                    if not re.search(r'\.(jpg|gif|jpeg|png|svg|tiff|webm|webp)$', url, flags=re.IGNORECASE):
-                        newMedia.append(url)
-                result["media"] = newMedia
-        if cliArgs.users:
-            result["users"] = requestRESTAPIUsers(website, fetchPage)
-        if not found:
-            logging.info(json.dumps({"message": "no results", "target": website}))
-        else:
-            if cliArgs.output_file:
-                with open(cliArgs.output_file, 'a') as f:
-                    if cnt > 0:
-                        f.write("\n")
-                    f.write(json.dumps(result))
+    try:
+        for website in websites:
+            result = {}
+            result["website"] = website
+            found = False
+            if cliArgs.posts:
+                result["posts"] = requestRESTAPI("posts", website, fetchPage)
+                if len(result["posts"]) > 0:
+                    found = True
+            if cliArgs.pages:
+                result["pages"] = requestRESTAPI("pages", website, fetchPage)
+                if len(result["pages"]) > 0:
+                    found = True
+            if cliArgs.comments:
+                result["comments"] = requestRESTAPIComments(website, fetchPage)
+                if len(result["comments"]) > 0:
+                    found = True
+            if cliArgs.media:
+                result["media"] = requestRESTAPI("media", website, fetchPage)
+                if cliArgs.ignoreImages:
+                    newMedia = []
+                    for url in result['media']:
+                        if not re.search(r'\.(jpg|gif|jpeg|png|svg|tiff|webm|webp)$', url, flags=re.IGNORECASE):
+                            newMedia.append(url)
+                    result["media"] = newMedia
+            if cliArgs.users:
+                result["users"] = requestRESTAPIUsers(website, fetchPage)
+            if not found:
+                logging.info(json.dumps({"message": "no results", "target": website}))
             else:
-                print(json.dumps(result))
-        cnt += 1
+                if cliArgs.output_file:
+                    with open(cliArgs.output_file, 'a') as f:
+                        if cnt > 0:
+                            f.write("\n")
+                        f.write(json.dumps(result))
+                else:
+                    print(json.dumps(result))
+            cnt += 1
+    except json.JSONDecodeError as e:
+        logging.warning(f"JSON decode error {e=}, {type(e)=}")
+    except urllib3.exceptions.MaxRetryError as e:
+        logging.warning(f"Max retries exceeded {e=}, {type(e)=}")
+    except requests.exceptions.ConnectionError as e:
+        logging.warning(f"Connection error {e=}, {type(e)=}")
+    except requests.exceptions.InvalidSchema as e:
+        logging.warning(f"Invalid schema {e=}, {type(e)=}")
+    except urllib3.exceptions.ReadTimeoutError as e:
+        logging.warning(f"Timeout {e=}, {type(e)=}")
+    except Exception as e:
+        logging.warning(f"Unexpected {e=}, {type(e)=}")
 
 
 if __name__ == '__main__':
