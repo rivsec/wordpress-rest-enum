@@ -159,8 +159,12 @@ def main():
                         if not re.search(r'\.(jpg|gif|jpeg|png|svg|tiff|webm|webp)$', url, flags=re.IGNORECASE):
                             newMedia.append(url)
                     result["media"] = newMedia
+                if len(result["media"]) > 0:
+                    found = True
             if cliArgs.users:
                 result["users"] = requestRESTAPIUsers(website, fetchPage)
+                if len(result["users"]) > 0:
+                    found = True
             if not found:
                 logging.info(json.dumps({"message": "no results", "target": website}))
             else:
