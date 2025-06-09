@@ -164,7 +164,9 @@ def main():
                     newMedia = []
                     # Base extensions to ignore if ignoreImages is True
                     extensions_to_ignore = (
-                        r'\.(jpg|gif|jpeg|png|svg|tiff|webm|webp|mp4|mov|avif)$' if cliArgs.ignoreImages else ''
+                        r'\.(jpg|gif|jpeg|png|svg|tiff|webm|webp|mp4|mov|avif|mp3|ttf|woff|eot|woff2|heic|tif|ogg|m4v)$'
+                        if cliArgs.ignoreImages
+                        else ''
                     )
 
                     # Add additional extensions if specified
