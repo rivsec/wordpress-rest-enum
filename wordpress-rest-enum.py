@@ -29,6 +29,13 @@ parser.add_argument(
     action=argparse.BooleanOptionalAction,
     required=False,
 )
+parser.add_argument(
+    "-be",
+    "--block-extensions",
+    help="Additional comma-separated file extensions to block (e.g. 'pdf,doc,docx')",
+    type=str,
+    required=False,
+)
 parser.add_argument("-o", "--output-file", help="Output file to save the results.", type=str, required=False)
 
 cliArgs = parser.parse_args()
@@ -153,10 +160,23 @@ def main():
                     found = True
             if cliArgs.media:
                 result["media"] = requestRESTAPI("media", website, fetchPage)
-                if cliArgs.ignoreImages:
+                if cliArgs.ignoreImages or cliArgs.block_extensions:
                     newMedia = []
+                    # Base extensions to ignore if ignoreImages is True
+                    extensions_to_ignore = (
+                        r'\.(jpg|gif|jpeg|png|svg|tiff|webm|webp|mp4|mov|avif)$' if cliArgs.ignoreImages else ''
+                    )
+
+                    # Add additional extensions if specified
+                    if cliArgs.block_extensions:
+                        additional_extensions = '|'.join(ext.strip() for ext in cliArgs.block_extensions.split(','))
+                        if extensions_to_ignore:
+                            extensions_to_ignore = f'({extensions_to_ignore}|{additional_extensions})$'
+                        else:
+                            extensions_to_ignore = f'\.({additional_extensions})$'
+
                     for url in result['media']:
-                        if not re.search(r'\.(jpg|gif|jpeg|png|svg|tiff|webm|webp)$', url, flags=re.IGNORECASE):
+                        if not re.search(extensions_to_ignore, url, flags=re.IGNORECASE):
                             newMedia.append(url)
                     result["media"] = newMedia
                 if len(result["media"]) > 0:
