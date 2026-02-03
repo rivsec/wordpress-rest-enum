@@ -13,15 +13,54 @@ urllib3.disable_warnings()
 parser = argparse.ArgumentParser()
 # Argument group, select either website or input file
 group = parser.add_mutually_exclusive_group(required=True)
-group.add_argument("-w", "--website", help="Website to check.", action='store', type=str)
-group.add_argument("-i", "--input-file", help="Input file containing list of websites", type=str)
+group.add_argument(
+    "-w", "--website", help="Website to check.", action="store", type=str
+)
+group.add_argument(
+    "-i", "--input-file", help="Input file containing list of websites", type=str
+)
 parser.add_argument_group(group)
-parser.add_argument("--log-level", default=logging.ERROR, type=lambda x: getattr(logging, x), help="Configure the logging level.")
-parser.add_argument("-m", "--media", help="Fetch media", action=argparse.BooleanOptionalAction, required=False)
-parser.add_argument("-po", "--posts", help="Fetch posts", action=argparse.BooleanOptionalAction, required=False)
-parser.add_argument("-pa", "--pages", help="Fetch pages", action=argparse.BooleanOptionalAction, required=False)
-parser.add_argument("-u", "--users", help="Fetch users", action=argparse.BooleanOptionalAction, required=False)
-parser.add_argument("-c", "--comments", help="Fetch comments", action=argparse.BooleanOptionalAction, required=False)
+parser.add_argument(
+    "--log-level",
+    default=logging.WARNING,
+    type=lambda x: getattr(logging, x),
+    help="Configure the logging level.",
+)
+parser.add_argument(
+    "-m",
+    "--media",
+    help="Fetch media",
+    action=argparse.BooleanOptionalAction,
+    required=False,
+)
+parser.add_argument(
+    "-po",
+    "--posts",
+    help="Fetch posts",
+    action=argparse.BooleanOptionalAction,
+    required=False,
+)
+parser.add_argument(
+    "-pa",
+    "--pages",
+    help="Fetch pages",
+    action=argparse.BooleanOptionalAction,
+    required=False,
+)
+parser.add_argument(
+    "-u",
+    "--users",
+    help="Fetch users",
+    action=argparse.BooleanOptionalAction,
+    required=False,
+)
+parser.add_argument(
+    "-c",
+    "--comments",
+    help="Fetch comments",
+    action=argparse.BooleanOptionalAction,
+    required=False,
+)
 parser.add_argument(
     "-im",
     "--ignoreImages",
@@ -36,7 +75,13 @@ parser.add_argument(
     type=str,
     required=False,
 )
-parser.add_argument("-o", "--output-file", help="Output file to save the results.", type=str, required=False)
+parser.add_argument(
+    "-o",
+    "--output-file",
+    help="Output file to save the results.",
+    type=str,
+    required=False,
+)
 
 cliArgs = parser.parse_args()
 
@@ -44,84 +89,112 @@ cliArgs = parser.parse_args()
 logging.basicConfig(level=cliArgs.log_level)
 
 # Globals
-HEADERS = {'User-Agent': 'WordPress Testing'}
+HEADERS = {"User-Agent": "WordPress Testing"}
+# Create a single session for reuse
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+SESSION.verify = False
+API_TIMEOUT = 3  # 3 seconds timeout for API requests
+
+# Compile regex patterns once
+IMAGE_EXTENSIONS_PATTERN = re.compile(
+    r"\.(jpg|gif|jpeg|png|svg|tiff|webm|webp|mp4|mov|avif|mp3|ttf|woff|eot|woff2|heic|tif|ogg|m4v|bmp|ico)$",
+    re.IGNORECASE,
+)
 
 
-def requestRESTAPIComments(website: str, fetchPage: int, timeout=10) -> json:
+def requestRESTAPIComments(website: str, fetchPage: int, timeout=API_TIMEOUT) -> json:
     perPage = 100
-    apiRequest = f'{website}/wp-json/wp/v2/comments?per_page={perPage}&page={str(fetchPage)}'
+    apiRequest = (
+        f"{website}/wp-json/wp/v2/comments?per_page={perPage}&page={str(fetchPage)}"
+    )
     results = []
     try:
-        with requests.Session() as s:
-            download = s.get(apiRequest, headers=HEADERS, verify=False, timeout=timeout)
-            if download.status_code == 200:
-                # WordPress API returns mixed HTML and JSON in the users API endpoint.
-                # Remove all content to the first `[` indicating the beginning of JSON data.
-                content = '[' + '['.join(download.text.split('[')[1:])
-                comments = json.loads(content)
-                for comment in comments:
-                    try:
-                        newComment = {"name": comment['author_name'], "date": comment['date'], "link": comment['link']}
-                        results.append(newComment)
-                    except Exception as err:
-                        print(f"Unexpected {err=}, {type(err)=}")
-                        raise
-                fetchPage = fetchPage + 1
-                if len(comments) > 0:
-                    results += requestRESTAPIComments(website, fetchPage)
+        download = SESSION.get(apiRequest, timeout=timeout)
+        if download.status_code == 200:
+            # WordPress API returns mixed HTML and JSON in the users API endpoint.
+            # Remove all content to the first `[` indicating the beginning of JSON data.
+            content = "[" + "[".join(download.text.split("[")[1:])
+            comments = json.loads(content)
+            for comment in comments:
+                try:
+                    newComment = {
+                        "name": comment["author_name"],
+                        "date": comment["date"],
+                        "link": comment["link"],
+                    }
+                    results.append(newComment)
+                except Exception as err:
+                    print(f"Unexpected {err=}, {type(err)=}")
+                    raise
+            fetchPage = fetchPage + 1
+            if len(comments) > 0:
+                results += requestRESTAPIComments(website, fetchPage)
+    except requests.exceptions.ReadTimeout as e:
+        logging.warning(f"ReadTimeout for comments API: {e}")
+        return results  # Return partial results and continue
     except:
         raise
 
     return results
 
 
-def requestRESTAPIUsers(website: str, fetchPage: int, timeout=10) -> json:
+def requestRESTAPIUsers(website: str, fetchPage: int, timeout=API_TIMEOUT) -> json:
     perPage = 100
-    apiRequest = f'{website}/wp-json/wp/v2/users?per_page={perPage}&page={str(fetchPage)}'
+    apiRequest = (
+        f"{website}/wp-json/wp/v2/users?per_page={perPage}&page={str(fetchPage)}"
+    )
     results = []
     try:
-        with requests.Session() as s:
-            download = s.get(apiRequest, headers=HEADERS, verify=False, timeout=timeout)
-            if download.status_code == 200:
-                content = download.text
-                users = json.loads(content)
-                for user in users:
-                    try:
-                        newUser = {"name": user['name'], "username": user['slug']}
-                        results.append(newUser)
-                    except Exception as err:
-                        print(f"Unexpected {err=}, {type(err)=}")
-                        raise
-                fetchPage = fetchPage + 1
-                if len(users) > 0:
-                    results += requestRESTAPIUsers(website, fetchPage)
-
+        download = SESSION.get(apiRequest, timeout=timeout)
+        if download.status_code == 200:
+            content = download.text
+            users = json.loads(content)
+            for user in users:
+                try:
+                    newUser = {"name": user["name"], "username": user["slug"]}
+                    results.append(newUser)
+                except Exception as err:
+                    print(f"Unexpected {err=}, {type(err)=}")
+                    raise
+            fetchPage = fetchPage + 1
+            if len(users) > 0:
+                results += requestRESTAPIUsers(website, fetchPage)
+    except requests.exceptions.ReadTimeout as e:
+        logging.warning(f"ReadTimeout for users API: {e}")
+        return results  # Return partial results and continue
     except:
         raise
     return results
 
 
-def requestRESTAPI(type: str, website: str, fetchPage: int, timeout=10) -> list:
+def requestRESTAPI(
+    type: str, website: str, fetchPage: int, timeout=API_TIMEOUT
+) -> list:
     perPage = 100
 
     try:
-        apiRequest = f'{website}/wp-json/wp/v2/{type}?per_page={perPage}&page={str(fetchPage)}'
+        apiRequest = (
+            f"{website}/wp-json/wp/v2/{type}?per_page={perPage}&page={str(fetchPage)}"
+        )
         results = []
-        with requests.Session() as s:
-            download = s.get(apiRequest, headers=HEADERS, verify=False, timeout=timeout)
-            if download.status_code == 200:
-                content = download.text
-                if content is not None:
-                    apiResponse = json.loads(content)
-                    for typeReturn in apiResponse:
-                        try:
-                            results.append(typeReturn['guid']['rendered'])
-                        except Exception as err:
-                            print(f"Unexpected {err=}, {type(err)=}")
-                            raise
-                    fetchPage = fetchPage + 1
-                    if len(apiResponse) > 0:
-                        results += requestRESTAPI(type, website, fetchPage)
+        download = SESSION.get(apiRequest, timeout=timeout)
+        if download.status_code == 200:
+            content = download.text
+            if content is not None:
+                apiResponse = json.loads(content)
+                for typeReturn in apiResponse:
+                    try:
+                        results.append(typeReturn["guid"]["rendered"])
+                    except Exception as err:
+                        print(f"Unexpected {err=}, {type(err)=}")
+                        raise
+                fetchPage = fetchPage + 1
+                if len(apiResponse) > 0:
+                    results += requestRESTAPI(type, website, fetchPage)
+    except requests.exceptions.ReadTimeout as e:
+        logging.warning(f"ReadTimeout for {type} API: {e}")
+        return results  # Return partial results and continue
     except:
         raise
 
@@ -131,7 +204,7 @@ def requestRESTAPI(type: str, website: str, fetchPage: int, timeout=10) -> list:
 def main():
     websites = []
     if cliArgs.input_file:
-        with open(cliArgs.input_file, 'r') as f:
+        with open(cliArgs.input_file, "r") as f:
             websites_from_file = f.readlines()
             for website in websites_from_file:
                 website = website.strip()
@@ -143,6 +216,7 @@ def main():
     cnt = 0
     try:
         for website in websites:
+            logging.info(f"Processing {website}")
             result = {}
             result["website"] = website
             found = False
@@ -164,21 +238,28 @@ def main():
                     newMedia = []
                     # Base extensions to ignore if ignoreImages is True
                     extensions_to_ignore = (
-                        r'\.(jpg|gif|jpeg|png|svg|tiff|webm|webp|mp4|mov|avif|mp3|ttf|woff|eot|woff2|heic|tif|ogg|m4v)$'
-                        if cliArgs.ignoreImages
-                        else ''
+                        IMAGE_EXTENSIONS_PATTERN if cliArgs.ignoreImages else None
                     )
 
                     # Add additional extensions if specified
                     if cliArgs.block_extensions:
-                        additional_extensions = '|'.join(ext.strip() for ext in cliArgs.block_extensions.split(','))
+                        additional_extensions = "|".join(
+                            ext.strip() for ext in cliArgs.block_extensions.split(",")
+                        )
                         if extensions_to_ignore:
-                            extensions_to_ignore = f'({extensions_to_ignore}|{additional_extensions})$'
+                            extensions_to_ignore = re.compile(
+                                f"({extensions_to_ignore.pattern}|{additional_extensions})$",
+                                re.IGNORECASE,
+                            )
                         else:
-                            extensions_to_ignore = f'\.({additional_extensions})$'
+                            extensions_to_ignore = re.compile(
+                                f"\.({additional_extensions})$", re.IGNORECASE
+                            )
 
-                    for url in result['media']:
-                        if not re.search(extensions_to_ignore, url, flags=re.IGNORECASE):
+                    for url in result["media"]:
+                        # Remove trailing slash if present before checking extension
+                        url_to_check = url.rstrip("/")
+                        if not extensions_to_ignore.search(url_to_check):
                             newMedia.append(url)
                     result["media"] = newMedia
                 if len(result["media"]) > 0:
@@ -191,7 +272,7 @@ def main():
                 logging.info(json.dumps({"message": "no results", "target": website}))
             else:
                 if cliArgs.output_file:
-                    with open(cliArgs.output_file, 'a') as f:
+                    with open(cliArgs.output_file, "a") as f:
                         if cnt > 0:
                             f.write("\n")
                         f.write(json.dumps(result))
@@ -206,11 +287,15 @@ def main():
         logging.warning(f"Connection error {e=}, {type(e)=}")
     except requests.exceptions.InvalidSchema as e:
         logging.warning(f"Invalid schema {e=}, {type(e)=}")
+    except requests.exceptions.ReadTimeout as e:
+        logging.warning(f"ReadTimeout {e=}, {type(e)=}")
     except urllib3.exceptions.ReadTimeoutError as e:
         logging.warning(f"Timeout {e=}, {type(e)=}")
     except Exception as e:
         logging.warning(f"Unexpected {e=}, {type(e)=}")
+    finally:
+        SESSION.close()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
