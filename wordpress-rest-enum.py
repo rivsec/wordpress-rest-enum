@@ -83,6 +83,14 @@ parser.add_argument(
     required=False,
 )
 
+parser.add_argument(
+    "-p",
+    "--proxy",
+    help="Address to the proxy server (e.g. socks5://127.0.0.1:9050)",
+    type=str,
+    required=False,
+)
+
 cliArgs = parser.parse_args()
 
 # Logging
@@ -94,6 +102,13 @@ HEADERS = {"User-Agent": "WordPress Testing"}
 SESSION = requests.Session()
 SESSION.headers.update(HEADERS)
 SESSION.verify = False
+
+if cliArgs.proxy:
+    SESSION.proxies = {
+        "http": cliArgs.proxy,
+        "https": cliArgs.proxy,
+    }
+
 API_TIMEOUT = 3  # 3 seconds timeout for API requests
 
 # Compile regex patterns once
