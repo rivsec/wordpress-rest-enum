@@ -91,6 +91,14 @@ parser.add_argument(
     required=False,
 )
 
+parser.add_argument(
+    "--json",
+    help="Output results in JSON format (default is plain text)",
+    action="store_true",
+    default=False,
+    dest="json_output",
+)
+
 cliArgs = parser.parse_args()
 
 # Logging
@@ -216,6 +224,49 @@ def requestRESTAPI(
     return results
 
 
+def format_plain_text(result: dict) -> str:
+    """Format a result dictionary as human-readable plain text."""
+    lines = []
+    lines.append("")
+    lines.append("=" * 40)
+    lines.append(f"Website: {result['website']}")
+    lines.append("=" * 40)
+
+    if "users" in result and result["users"]:
+        lines.append("")
+        lines.append("--- Users ---")
+        for user in result["users"]:
+            lines.append(f"  {user['name']} ({user['username']})")
+
+    if "posts" in result and result["posts"]:
+        lines.append("")
+        lines.append("--- Posts ---")
+        for post in result["posts"]:
+            lines.append(f"  {post}")
+
+    if "pages" in result and result["pages"]:
+        lines.append("")
+        lines.append("--- Pages ---")
+        for page in result["pages"]:
+            lines.append(f"  {page}")
+
+    if "comments" in result and result["comments"]:
+        lines.append("")
+        lines.append("--- Comments ---")
+        for comment in result["comments"]:
+            lines.append(f"  {comment['name']} ({comment['date']})")
+            lines.append(f"    {comment['link']}")
+
+    if "media" in result and result["media"]:
+        lines.append("")
+        lines.append("--- Media ---")
+        for media in result["media"]:
+            lines.append(f"  {media}")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
 def main():
     websites = []
     if cliArgs.input_file:
@@ -284,15 +335,23 @@ def main():
                 if len(result["users"]) > 0:
                     found = True
             if not found:
-                logging.info(json.dumps({"message": "no results", "target": website}))
+                if cliArgs.json_output:
+                    logging.info(json.dumps({"message": "no results", "target": website}))
+                else:
+                    logging.info(f"No results for {website}")
             else:
+                if cliArgs.json_output:
+                    output = json.dumps(result)
+                else:
+                    output = format_plain_text(result)
+
                 if cliArgs.output_file:
                     with open(cliArgs.output_file, "a") as f:
                         if cnt > 0:
                             f.write("\n")
-                        f.write(json.dumps(result))
+                        f.write(output)
                 else:
-                    print(json.dumps(result))
+                    print(output)
             cnt += 1
     except json.JSONDecodeError as e:
         logging.warning(f"JSON decode error {e=}, {type(e)=}")
