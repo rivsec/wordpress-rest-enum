@@ -2,7 +2,7 @@
 A WordPress rest-enumeration script
 
 # Install
-- Pro Tip: utilize Python venv
+- Pro Tip: utilize Python venv: `python -m venv .\venv;source .\venv\bin\activate`
 
 `pip install -r requirements.txt`
 
