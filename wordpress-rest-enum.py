@@ -91,6 +91,14 @@ parser.add_argument(
     required=False,
 )
 
+parser.add_argument(
+    "-j",
+    "--json",
+    help="Output results in JSON format (default is plain text)",
+    action="store_true",
+    required=False,
+)
+
 cliArgs = parser.parse_args()
 
 # Logging
@@ -216,6 +224,57 @@ def requestRESTAPI(
     return results
 
 
+def format_result_plain(result: dict) -> str:
+    """Format result dictionary as human-readable plain text."""
+    lines = []
+    lines.append(f"===== {result['website']} =====")
+
+    if "users" in result and result["users"]:
+        lines.append("")
+        lines.append("[Users]")
+        for user in result["users"]:
+            lines.append(f"  Name: {user['name']}")
+            lines.append(f"  Username: {user['username']}")
+            lines.append("  ---")
+
+    if "posts" in result and result["posts"]:
+        lines.append("")
+        lines.append("[Posts]")
+        for post in result["posts"]:
+            lines.append(f"  {post}")
+
+    if "pages" in result and result["pages"]:
+        lines.append("")
+        lines.append("[Pages]")
+        for page in result["pages"]:
+            lines.append(f"  {page}")
+
+    if "media" in result and result["media"]:
+        lines.append("")
+        lines.append("[Media]")
+        for media in result["media"]:
+            lines.append(f"  {media}")
+
+    if "comments" in result and result["comments"]:
+        lines.append("")
+        lines.append("[Comments]")
+        for comment in result["comments"]:
+            lines.append(f"  Name: {comment['name']}")
+            lines.append(f"  Date: {comment['date']}")
+            lines.append(f"  Link: {comment['link']}")
+            lines.append("  ---")
+
+    return "\n".join(lines)
+
+
+def format_result(result: dict, use_json: bool) -> str:
+    """Format result based on output preference."""
+    if use_json:
+        return json.dumps(result)
+    else:
+        return format_result_plain(result)
+
+
 def main():
     websites = []
     if cliArgs.input_file:
@@ -227,6 +286,8 @@ def main():
     else:
         websites.append(cliArgs.website)
     fetchPage = 1
+
+    use_json = cliArgs.json
 
     cnt = 0
     try:
@@ -284,15 +345,19 @@ def main():
                 if len(result["users"]) > 0:
                     found = True
             if not found:
-                logging.info(json.dumps({"message": "no results", "target": website}))
+                if use_json:
+                    logging.info(json.dumps({"message": "no results", "target": website}))
+                else:
+                    logging.info(f"No results for {website}")
             else:
+                output = format_result(result, use_json)
                 if cliArgs.output_file:
                     with open(cliArgs.output_file, "a") as f:
                         if cnt > 0:
                             f.write("\n")
-                        f.write(json.dumps(result))
+                        f.write(output)
                 else:
-                    print(json.dumps(result))
+                    print(output)
             cnt += 1
     except json.JSONDecodeError as e:
         logging.warning(f"JSON decode error {e=}, {type(e)=}")
