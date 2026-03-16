@@ -91,6 +91,13 @@ parser.add_argument(
     required=False,
 )
 
+parser.add_argument(
+    "--json",
+    help="Output in JSON format",
+    action="store_true",
+    required=False,
+)
+
 cliArgs = parser.parse_args()
 
 # Logging
@@ -216,6 +223,32 @@ def requestRESTAPI(
     return results
 
 
+def format_plain_text(result):
+    lines = []
+    lines.append(f"Website: {result['website']}")
+    if "users" in result and result["users"]:
+        lines.append("Users:")
+        for user in result["users"]:
+            lines.append(f"  Name: {user['name']}, Username: {user['username']}")
+    if "posts" in result and result["posts"]:
+        lines.append("Posts:")
+        for post in result["posts"]:
+            lines.append(f"  {post}")
+    if "pages" in result and result["pages"]:
+        lines.append("Pages:")
+        for page in result["pages"]:
+            lines.append(f"  {page}")
+    if "media" in result and result["media"]:
+        lines.append("Media:")
+        for media in result["media"]:
+            lines.append(f"  {media}")
+    if "comments" in result and result["comments"]:
+        lines.append("Comments:")
+        for comment in result["comments"]:
+            lines.append(f"  Name: {comment['name']}, Date: {comment['date']}, Link: {comment['link']}")
+    return "\n".join(lines)
+
+
 def main():
     websites = []
     if cliArgs.input_file:
@@ -286,13 +319,17 @@ def main():
             if not found:
                 logging.info(json.dumps({"message": "no results", "target": website}))
             else:
+                if cliArgs.json:
+                    output = json.dumps(result)
+                else:
+                    output = format_plain_text(result)
                 if cliArgs.output_file:
                     with open(cliArgs.output_file, "a") as f:
                         if cnt > 0:
                             f.write("\n")
-                        f.write(json.dumps(result))
+                        f.write(output)
                 else:
-                    print(json.dumps(result))
+                    print(output)
             cnt += 1
     except json.JSONDecodeError as e:
         logging.warning(f"JSON decode error {e=}, {type(e)=}")
