@@ -8,3 +8,5 @@ A WordPress rest-enumeration script
 
 # Usage
 Enumerate users and media files: `python ./wordpress-rest-enum.py -w https://targetwebsite.com -u -m `
+
+Output in JSON format: `python ./wordpress-rest-enum.py -w https://targetwebsite.com -u -m --json`
