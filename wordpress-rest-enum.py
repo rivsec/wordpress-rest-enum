@@ -301,7 +301,7 @@ def main():
                             )
                         else:
                             extensions_to_ignore = re.compile(
-                                f"\.({additional_extensions})$", re.IGNORECASE
+                                rf"\.({additional_extensions})$", re.IGNORECASE
                             )
 
                     for url in result["media"]:
