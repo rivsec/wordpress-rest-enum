@@ -1,2 +1,14 @@
 venv/
 .vscode/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Downloaded media / pentest loot - never commit
+loot/
+downloaded_media/
+
+# Local target lists and test output
+targets.txt
+reg_dl/
