@@ -6,6 +6,11 @@ import argparse
 import logging
 import urllib3
 import re
+import os
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from urllib.parse import urlsplit, unquote
 
 urllib3.disable_warnings()
 
@@ -31,6 +36,19 @@ parser.add_argument(
     "--media",
     help="Fetch media",
     action=argparse.BooleanOptionalAction,
+    required=False,
+)
+parser.add_argument(
+    "-dm",
+    "--download-media",
+    help=(
+        "Download all discovered media files to a directory "
+        "(default: ./downloaded_media). Implies --media."
+    ),
+    nargs="?",
+    const="downloaded_media",
+    default=None,
+    type=str,
     required=False,
 )
 parser.add_argument(
@@ -98,7 +116,22 @@ parser.add_argument(
     required=False,
 )
 
+parser.add_argument(
+    "-t",
+    "--threads",
+    help=(
+        "Maximum number of concurrent HTTP requests across all work "
+        "(websites, fetches, and downloads). Default: 5."
+    ),
+    type=int,
+    default=5,
+    required=False,
+)
+
 cliArgs = parser.parse_args()
+
+if cliArgs.threads < 1:
+    parser.error("--threads must be at least 1")
 
 # Logging
 logging.basicConfig(level=cliArgs.log_level)
@@ -128,6 +161,60 @@ if cliArgs.proxy:
         "https": cliArgs.proxy,
     }
 
+# Size the connection pool to the concurrency level so threads are not
+# serialised waiting for a free connection.
+_adapter = requests.adapters.HTTPAdapter(
+    pool_connections=cliArgs.threads,
+    pool_maxsize=cliArgs.threads,
+)
+SESSION.mount("http://", _adapter)
+SESSION.mount("https://", _adapter)
+
+# Global cap on concurrent HTTP requests. Every request acquires this
+# before hitting the network, so no matter how work nests (websites ->
+# content types -> media downloads) at most `threads` requests are ever
+# in flight at once. This is what makes "N at a time" true end to end.
+REQUEST_SEMAPHORE = threading.BoundedSemaphore(cliArgs.threads)
+
+# Serialises writes to stdout / the output file so concurrent websites
+# don't interleave their result blocks.
+OUTPUT_LOCK = threading.Lock()
+
+# Set on Ctrl-C. Workers poll it and bail out instead of starting new
+# network work, so the pools drain quickly and the process can exit.
+STOP = threading.Event()
+
+
+def _run_pool(workers, fn, items):
+    """Map `fn` over `items` in a thread pool, Ctrl-C-aware.
+
+    On KeyboardInterrupt the stop flag is set and pending tasks are
+    cancelled *before* the pool is joined, so already-running workers
+    return at their next stop check (bounded by the request timeout)
+    and queued work never starts. Returns the list of results.
+    """
+    results = []
+    ex = ThreadPoolExecutor(max_workers=workers)
+    futures = [ex.submit(fn, item) for item in items]
+    pending = set(futures)
+    try:
+        # Wait in short slices rather than one long blocking wait. On
+        # Windows a KeyboardInterrupt is only raised in the main thread
+        # when it returns from a wait, so the timeout is what lets Ctrl-C
+        # take effect promptly instead of after all work finishes.
+        while pending:
+            done, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+            for fut in done:
+                results.append(fut.result())
+    except KeyboardInterrupt:
+        STOP.set()
+        for f in futures:
+            f.cancel()
+        ex.shutdown(wait=False, cancel_futures=True)
+        raise
+    ex.shutdown(wait=False)
+    return results
+
 API_TIMEOUT = 3  # 3 seconds timeout for API requests
 
 # Compile regex patterns once
@@ -138,13 +225,16 @@ IMAGE_EXTENSIONS_PATTERN = re.compile(
 
 
 def requestRESTAPIComments(website: str, fetchPage: int, timeout=API_TIMEOUT) -> json:
+    if STOP.is_set():
+        return []
     perPage = 100
     apiRequest = (
         f"{website}/wp-json/wp/v2/comments?per_page={perPage}&page={str(fetchPage)}"
     )
     results = []
     try:
-        download = SESSION.get(apiRequest, timeout=timeout)
+        with REQUEST_SEMAPHORE:
+            download = SESSION.get(apiRequest, timeout=timeout)
         if download.status_code == 200:
             # WordPress API returns mixed HTML and JSON in the users API endpoint.
             # Remove all content to the first `[` indicating the beginning of JSON data.
@@ -174,13 +264,16 @@ def requestRESTAPIComments(website: str, fetchPage: int, timeout=API_TIMEOUT) ->
 
 
 def requestRESTAPIUsers(website: str, fetchPage: int, timeout=API_TIMEOUT) -> json:
+    if STOP.is_set():
+        return []
     perPage = 100
     apiRequest = (
         f"{website}/wp-json/wp/v2/users?per_page={perPage}&page={str(fetchPage)}"
     )
     results = []
     try:
-        download = SESSION.get(apiRequest, timeout=timeout)
+        with REQUEST_SEMAPHORE:
+            download = SESSION.get(apiRequest, timeout=timeout)
         if download.status_code == 200:
             content = download.text
             users = json.loads(content)
@@ -205,6 +298,8 @@ def requestRESTAPIUsers(website: str, fetchPage: int, timeout=API_TIMEOUT) -> js
 def requestRESTAPI(
     type: str, website: str, fetchPage: int, timeout=API_TIMEOUT
 ) -> list:
+    if STOP.is_set():
+        return []
     perPage = 100
 
     try:
@@ -212,7 +307,8 @@ def requestRESTAPI(
             f"{website}/wp-json/wp/v2/{type}?per_page={perPage}&page={str(fetchPage)}"
         )
         results = []
-        download = SESSION.get(apiRequest, timeout=timeout)
+        with REQUEST_SEMAPHORE:
+            download = SESSION.get(apiRequest, timeout=timeout)
         if download.status_code == 200:
             content = download.text
             if content is not None:
@@ -233,6 +329,129 @@ def requestRESTAPI(
         raise
 
     return results
+
+
+def _safe_filename_from_url(url: str) -> str:
+    """Derive a safe local filename from a media URL.
+
+    The URL comes from the (untrusted) target server, so the name is
+    treated as hostile: percent-decoded first, then reduced to a single
+    path component with no separators, traversal sequences, or leading
+    dots. The caller still enforces containment before writing.
+    """
+    path = urlsplit(url).path
+    # Decode BEFORE splitting so encoded separators (%2f, %5c) can't
+    # smuggle a path through os.path.basename.
+    decoded = unquote(path)
+    # Normalise both separators, then take the last component.
+    name = re.split(r"[\\/]", decoded.rstrip("/\\"))[-1]
+    # Strip characters illegal on common filesystems.
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
+    # Remove leading dots so names like "..", "." or ".bashrc" can't
+    # point at the parent dir or hide as dotfiles.
+    name = name.lstrip(". ").strip()
+    # Cap length to stay within filesystem limits.
+    if len(name) > 200:
+        root, ext = os.path.splitext(name)
+        name = root[: 200 - len(ext)] + ext
+    return name or "unnamed"
+
+
+def _target_dir(base_dir: str, website: str) -> str:
+    """Per-host subdirectory so multiple targets don't collide."""
+    host = urlsplit(website).netloc or "unknown_host"
+    host = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", host)
+    return os.path.join(base_dir, host)
+
+
+def _download_one(url: str, out_dir: str, out_real: str, timeout) -> bool:
+    """Download a single media URL into out_dir. Returns True on success.
+
+    Safe to run from many threads at once: the exclusive-create open is
+    the sole arbiter of filenames, so concurrent downloads can neither
+    overwrite each other nor race, and no shared name bookkeeping is
+    needed.
+    """
+    if STOP.is_set():
+        return False
+    base = _safe_filename_from_url(url)
+    root, ext = os.path.splitext(base)
+    try:
+        with REQUEST_SEMAPHORE:
+            if STOP.is_set():
+                return False
+            with SESSION.get(url, timeout=timeout, stream=True) as resp:
+                if resp.status_code != 200:
+                    logging.warning(f"Skipping {url}: HTTP {resp.status_code}")
+                    return False
+                # Pick a name, verify it stays inside out_dir, and create
+                # it exclusively ("xb"): never overwrite an existing file,
+                # never follow a pre-planted symlink, no check-then-write
+                # race. On collision or an unsafe (symlinked) name, try the
+                # next suffix.
+                f = None
+                attempt = 0
+                dest = None
+                while f is None:
+                    candidate = base if attempt == 0 else f"{root}_{attempt}{ext}"
+                    dest = os.path.join(out_dir, candidate)
+                    if os.path.dirname(os.path.realpath(dest)) != out_real:
+                        logging.warning(
+                            f"Skipping unsafe target for {url}: {dest}"
+                        )
+                        attempt += 1
+                        if attempt > 10000:
+                            return False
+                        continue
+                    try:
+                        f = open(dest, "xb")
+                    except FileExistsError:
+                        attempt += 1
+                        if attempt > 10000:
+                            logging.warning(
+                                f"Too many name collisions for {url}"
+                            )
+                            return False
+                with f:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+        logging.info(f"Downloaded {url} -> {dest}")
+        return True
+    except requests.exceptions.RequestException as e:
+        logging.warning(f"Failed to download {url}: {e}")
+        return False
+    except OSError as e:
+        logging.warning(f"Failed to write file for {url}: {e}")
+        return False
+
+
+def downloadMedia(
+    urls, base_dir: str, website: str, timeout=API_TIMEOUT, threads: int = 1
+) -> int:
+    """Download all media URLs into base_dir/<host>/ concurrently.
+
+    Returns the number downloaded. Up to `threads` downloads run at once,
+    still bounded by the global request semaphore.
+    """
+    if not urls:
+        return 0
+    out_dir = _target_dir(base_dir, website)
+    os.makedirs(out_dir, exist_ok=True)
+    # Resolve the real output dir once so each worker can verify its
+    # target stays inside it, defeating traversal regardless of quirks.
+    out_real = os.path.realpath(out_dir)
+
+    workers = max(1, min(threads, len(urls)))
+    outcomes = _run_pool(
+        workers,
+        lambda url: _download_one(url, out_dir, out_real, timeout),
+        urls,
+    )
+    downloaded = sum(1 for ok in outcomes if ok)
+
+    logging.info(f"Downloaded {downloaded}/{len(urls)} media files to {out_dir}")
+    return downloaded
 
 
 def format_plain_text(result):
@@ -261,102 +480,138 @@ def format_plain_text(result):
     return "\n".join(lines)
 
 
+def _filter_media(media_urls):
+    """Drop media URLs whose extension matches the ignore/block filters."""
+    extensions_to_ignore = (
+        IMAGE_EXTENSIONS_PATTERN if cliArgs.ignoreImages else None
+    )
+    if cliArgs.block_extensions:
+        additional_extensions = "|".join(
+            ext.strip() for ext in cliArgs.block_extensions.split(",")
+        )
+        if extensions_to_ignore:
+            extensions_to_ignore = re.compile(
+                f"({extensions_to_ignore.pattern}|{additional_extensions})$",
+                re.IGNORECASE,
+            )
+        else:
+            extensions_to_ignore = re.compile(
+                rf"\.({additional_extensions})$", re.IGNORECASE
+            )
+
+    filtered = []
+    for url in media_urls:
+        # Remove trailing slash if present before checking extension
+        if not extensions_to_ignore.search(url.rstrip("/")):
+            filtered.append(url)
+    return filtered
+
+
+def _safe_fetch(key, fn):
+    """Run one fetch task, isolating its failure from the other types."""
+    try:
+        return fn()
+    except Exception as e:
+        logging.warning(f"Failed to fetch {key} ({type(e).__name__}): {e}")
+        return []
+
+
+def process_website(website):
+    """Fetch everything requested for one site. Returns (result, found).
+
+    The enabled content types are fetched concurrently; media is then
+    filtered and (optionally) downloaded.
+    """
+    logging.info(f"Processing {website}")
+    result = {"website": website}
+
+    tasks = {}
+    if cliArgs.posts:
+        tasks["posts"] = lambda w=website: requestRESTAPI("posts", w, 1)
+    if cliArgs.pages:
+        tasks["pages"] = lambda w=website: requestRESTAPI("pages", w, 1)
+    if cliArgs.comments:
+        tasks["comments"] = lambda w=website: requestRESTAPIComments(w, 1)
+    if cliArgs.media or cliArgs.download_media:
+        tasks["media"] = lambda w=website: requestRESTAPI("media", w, 1)
+    if cliArgs.users:
+        tasks["users"] = lambda w=website: requestRESTAPIUsers(w, 1)
+
+    if tasks:
+        workers = max(1, min(len(tasks), cliArgs.threads))
+        for key, value in _run_pool(
+            workers,
+            lambda item: (item[0], _safe_fetch(item[0], item[1])),
+            list(tasks.items()),
+        ):
+            result[key] = value
+
+    found = any(result.get(k) for k in ("posts", "pages", "comments", "users"))
+
+    if "media" in result:
+        if cliArgs.ignoreImages or cliArgs.block_extensions:
+            result["media"] = _filter_media(result["media"])
+        if result["media"]:
+            found = True
+        if cliArgs.download_media:
+            count = downloadMedia(
+                result["media"],
+                cliArgs.download_media,
+                website,
+                threads=cliArgs.threads,
+            )
+            logging.info(f"Saved {count} media file(s) for {website}")
+
+    return result, found
+
+
 def main():
     websites = []
     if cliArgs.input_file:
         with open(cliArgs.input_file, "r") as f:
-            websites_from_file = f.readlines()
-            for website in websites_from_file:
+            for website in f.readlines():
                 website = website.strip()
-                websites.append(website)
+                if website:
+                    websites.append(website)
     else:
         websites.append(cliArgs.website)
-    fetchPage = 1
 
-    cnt = 0
-    try:
-        for website in websites:
-            logging.info(f"Processing {website}")
-            result = {}
-            result["website"] = website
-            found = False
-            if cliArgs.posts:
-                result["posts"] = requestRESTAPI("posts", website, fetchPage)
-                if len(result["posts"]) > 0:
-                    found = True
-            if cliArgs.pages:
-                result["pages"] = requestRESTAPI("pages", website, fetchPage)
-                if len(result["pages"]) > 0:
-                    found = True
-            if cliArgs.comments:
-                result["comments"] = requestRESTAPIComments(website, fetchPage)
-                if len(result["comments"]) > 0:
-                    found = True
-            if cliArgs.media:
-                result["media"] = requestRESTAPI("media", website, fetchPage)
-                if cliArgs.ignoreImages or cliArgs.block_extensions:
-                    newMedia = []
-                    # Base extensions to ignore if ignoreImages is True
-                    extensions_to_ignore = (
-                        IMAGE_EXTENSIONS_PATTERN if cliArgs.ignoreImages else None
-                    )
+    written = 0
 
-                    # Add additional extensions if specified
-                    if cliArgs.block_extensions:
-                        additional_extensions = "|".join(
-                            ext.strip() for ext in cliArgs.block_extensions.split(",")
-                        )
-                        if extensions_to_ignore:
-                            extensions_to_ignore = re.compile(
-                                f"({extensions_to_ignore.pattern}|{additional_extensions})$",
-                                re.IGNORECASE,
-                            )
-                        else:
-                            extensions_to_ignore = re.compile(
-                                rf"\.({additional_extensions})$", re.IGNORECASE
-                            )
-
-                    for url in result["media"]:
-                        # Remove trailing slash if present before checking extension
-                        url_to_check = url.rstrip("/")
-                        if not extensions_to_ignore.search(url_to_check):
-                            newMedia.append(url)
-                    result["media"] = newMedia
-                if len(result["media"]) > 0:
-                    found = True
-            if cliArgs.users:
-                result["users"] = requestRESTAPIUsers(website, fetchPage)
-                if len(result["users"]) > 0:
-                    found = True
-            if not found:
-                logging.info(json.dumps({"message": "no results", "target": website}))
+    def handle(website):
+        nonlocal written
+        try:
+            result, found = process_website(website)
+        except Exception as e:
+            logging.warning(f"Unexpected error for {website}: {e=}, {type(e)=}")
+            return
+        if not found:
+            logging.info(json.dumps({"message": "no results", "target": website}))
+            return
+        output = json.dumps(result) if cliArgs.json else format_plain_text(result)
+        # Serialise output so concurrent sites don't interleave blocks.
+        with OUTPUT_LOCK:
+            if cliArgs.output_file:
+                with open(cliArgs.output_file, "a") as f:
+                    if written > 0:
+                        f.write("\n")
+                    f.write(output)
             else:
-                if cliArgs.json:
-                    output = json.dumps(result)
-                else:
-                    output = format_plain_text(result)
-                if cliArgs.output_file:
-                    with open(cliArgs.output_file, "a") as f:
-                        if cnt > 0:
-                            f.write("\n")
-                        f.write(output)
-                else:
-                    print(output)
-            cnt += 1
-    except json.JSONDecodeError as e:
-        logging.warning(f"JSON decode error {e=}, {type(e)=}")
-    except urllib3.exceptions.MaxRetryError as e:
-        logging.warning(f"Max retries exceeded {e=}, {type(e)=}")
-    except requests.exceptions.ConnectionError as e:
-        logging.warning(f"Connection error {e=}, {type(e)=}")
-    except requests.exceptions.InvalidSchema as e:
-        logging.warning(f"Invalid schema {e=}, {type(e)=}")
-    except requests.exceptions.ReadTimeout as e:
-        logging.warning(f"ReadTimeout {e=}, {type(e)=}")
-    except urllib3.exceptions.ReadTimeoutError as e:
-        logging.warning(f"Timeout {e=}, {type(e)=}")
-    except Exception as e:
-        logging.warning(f"Unexpected {e=}, {type(e)=}")
+                print(output)
+            written += 1
+
+    try:
+        if len(websites) > 1 and cliArgs.threads > 1:
+            workers = min(len(websites), cliArgs.threads)
+            _run_pool(workers, handle, websites)
+        else:
+            for website in websites:
+                handle(website)
+    except KeyboardInterrupt:
+        STOP.set()
+        logging.warning("Interrupted, shutting down (finishing in-flight requests)...")
+        SESSION.close()
+        sys.exit(130)
     finally:
         SESSION.close()
 
