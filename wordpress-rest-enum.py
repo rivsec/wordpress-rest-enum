@@ -8,7 +8,10 @@ import urllib3
 import re
 import os
 import sys
+import random
+import datetime
 import threading
+from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from urllib.parse import urlsplit, unquote
 
@@ -223,6 +226,92 @@ IMAGE_EXTENSIONS_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Rate-limit handling. Retry 429 (Too Many Requests) and 503 (Service
+# Unavailable); both commonly carry a Retry-After header.
+RETRY_STATUSES = (429, 503)
+MAX_RETRIES = 5            # attempts after the first try
+RETRY_AFTER_CAP = 120.0    # never honour a Retry-After longer than this
+BACKOFF_BASE = 1.0         # seconds, for exponential backoff when no header
+BACKOFF_CAP = 30.0         # cap a single backoff wait
+
+
+def _parse_retry_after(value):
+    """Seconds to wait from a Retry-After header value, or None.
+
+    Supports both the delta-seconds form ("120") and the HTTP-date form
+    ("Wed, 21 Oct 2026 07:28:00 GMT").
+    """
+    if not value:
+        return None
+    value = value.strip()
+    if value.isdigit():
+        return float(value)
+    try:
+        dt = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    delta = (dt - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+    return max(0.0, delta)
+
+
+def _retry_wait(resp, attempt):
+    """Seconds to wait before retrying `resp`, or None if it is not a
+    retryable rate-limit response."""
+    if resp.status_code not in RETRY_STATUSES:
+        return None
+    seconds = _parse_retry_after(resp.headers.get("Retry-After"))
+    if seconds is not None:
+        return min(seconds, RETRY_AFTER_CAP)
+    # No header: exponential backoff with 50-100% jitter.
+    backoff = min(BACKOFF_BASE * (2 ** attempt), BACKOFF_CAP)
+    return backoff * (0.5 + random.random() * 0.5)
+
+
+def _interruptible_sleep(seconds):
+    """Sleep up to `seconds`, waking immediately if STOP is set.
+
+    Returns True if the full time elapsed, False if interrupted so the
+    caller can abort instead of issuing another request.
+    """
+    return not STOP.wait(timeout=max(0.0, seconds))
+
+
+def _get_with_retry(url, timeout):
+    """Non-streaming GET that retries 429/503 honouring Retry-After.
+
+    Returns the Response (the final one if retries are exhausted) or None
+    if interrupted via STOP. Network exceptions propagate to the caller's
+    existing handlers. The request semaphore is held only during each GET,
+    never across the backoff wait.
+    """
+    resp = None
+    for attempt in range(MAX_RETRIES + 1):
+        if STOP.is_set():
+            return None
+        with REQUEST_SEMAPHORE:
+            if STOP.is_set():
+                return None
+            resp = SESSION.get(url, timeout=timeout)
+        wait_s = _retry_wait(resp, attempt)
+        if wait_s is None:
+            return resp
+        if attempt >= MAX_RETRIES:
+            logging.warning(
+                f"Giving up after {MAX_RETRIES} retries (HTTP {resp.status_code}): {url}"
+            )
+            return resp
+        logging.info(
+            f"HTTP {resp.status_code} for {url}; backing off {wait_s:.1f}s "
+            f"(retry {attempt + 1}/{MAX_RETRIES})"
+        )
+        if not _interruptible_sleep(wait_s):
+            return None
+    return resp
+
 
 def requestRESTAPIComments(website: str, fetchPage: int, timeout=API_TIMEOUT) -> json:
     if STOP.is_set():
@@ -233,9 +322,8 @@ def requestRESTAPIComments(website: str, fetchPage: int, timeout=API_TIMEOUT) ->
     )
     results = []
     try:
-        with REQUEST_SEMAPHORE:
-            download = SESSION.get(apiRequest, timeout=timeout)
-        if download.status_code == 200:
+        download = _get_with_retry(apiRequest, timeout)
+        if download is not None and download.status_code == 200:
             # WordPress API returns mixed HTML and JSON in the users API endpoint.
             # Remove all content to the first `[` indicating the beginning of JSON data.
             content = "[" + "[".join(download.text.split("[")[1:])
@@ -272,9 +360,8 @@ def requestRESTAPIUsers(website: str, fetchPage: int, timeout=API_TIMEOUT) -> js
     )
     results = []
     try:
-        with REQUEST_SEMAPHORE:
-            download = SESSION.get(apiRequest, timeout=timeout)
-        if download.status_code == 200:
+        download = _get_with_retry(apiRequest, timeout)
+        if download is not None and download.status_code == 200:
             content = download.text
             users = json.loads(content)
             for user in users:
@@ -307,9 +394,8 @@ def requestRESTAPI(
             f"{website}/wp-json/wp/v2/{type}?per_page={perPage}&page={str(fetchPage)}"
         )
         results = []
-        with REQUEST_SEMAPHORE:
-            download = SESSION.get(apiRequest, timeout=timeout)
-        if download.status_code == 200:
+        download = _get_with_retry(apiRequest, timeout)
+        if download is not None and download.status_code == 200:
             content = download.text
             if content is not None:
                 apiResponse = json.loads(content)
@@ -377,47 +463,74 @@ def _download_one(url: str, out_dir: str, out_real: str, timeout) -> bool:
     base = _safe_filename_from_url(url)
     root, ext = os.path.splitext(base)
     try:
-        with REQUEST_SEMAPHORE:
+        for retry in range(MAX_RETRIES + 1):
             if STOP.is_set():
                 return False
-            with SESSION.get(url, timeout=timeout, stream=True) as resp:
-                if resp.status_code != 200:
-                    logging.warning(f"Skipping {url}: HTTP {resp.status_code}")
+            with REQUEST_SEMAPHORE:
+                if STOP.is_set():
                     return False
-                # Pick a name, verify it stays inside out_dir, and create
-                # it exclusively ("xb"): never overwrite an existing file,
-                # never follow a pre-planted symlink, no check-then-write
-                # race. On collision or an unsafe (symlinked) name, try the
-                # next suffix.
-                f = None
-                attempt = 0
-                dest = None
-                while f is None:
-                    candidate = base if attempt == 0 else f"{root}_{attempt}{ext}"
-                    dest = os.path.join(out_dir, candidate)
-                    if os.path.dirname(os.path.realpath(dest)) != out_real:
-                        logging.warning(
-                            f"Skipping unsafe target for {url}: {dest}"
-                        )
-                        attempt += 1
-                        if attempt > 10000:
-                            return False
-                        continue
-                    try:
-                        f = open(dest, "xb")
-                    except FileExistsError:
-                        attempt += 1
-                        if attempt > 10000:
+                with SESSION.get(url, timeout=timeout, stream=True) as resp:
+                    wait_s = _retry_wait(resp, retry)
+                    if wait_s is None:
+                        # Not a retryable rate-limit: either success or a
+                        # terminal non-200 we skip.
+                        if resp.status_code != 200:
                             logging.warning(
-                                f"Too many name collisions for {url}"
+                                f"Skipping {url}: HTTP {resp.status_code}"
                             )
                             return False
-                with f:
-                    for chunk in resp.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-        logging.info(f"Downloaded {url} -> {dest}")
-        return True
+                        # Pick a name, verify it stays inside out_dir, and
+                        # create it exclusively ("xb"): never overwrite an
+                        # existing file, never follow a pre-planted symlink,
+                        # no check-then-write race. On collision or an unsafe
+                        # (symlinked) name, try the next suffix.
+                        f = None
+                        attempt = 0
+                        dest = None
+                        while f is None:
+                            candidate = (
+                                base if attempt == 0 else f"{root}_{attempt}{ext}"
+                            )
+                            dest = os.path.join(out_dir, candidate)
+                            if os.path.dirname(os.path.realpath(dest)) != out_real:
+                                logging.warning(
+                                    f"Skipping unsafe target for {url}: {dest}"
+                                )
+                                attempt += 1
+                                if attempt > 10000:
+                                    return False
+                                continue
+                            try:
+                                f = open(dest, "xb")
+                            except FileExistsError:
+                                attempt += 1
+                                if attempt > 10000:
+                                    logging.warning(
+                                        f"Too many name collisions for {url}"
+                                    )
+                                    return False
+                        with f:
+                            for chunk in resp.iter_content(chunk_size=8192):
+                                if chunk:
+                                    f.write(chunk)
+                        logging.info(f"Downloaded {url} -> {dest}")
+                        return True
+                    # Rate-limited: give up if out of retries.
+                    if retry >= MAX_RETRIES:
+                        logging.warning(
+                            f"Giving up on {url} after {MAX_RETRIES} retries "
+                            f"(HTTP {resp.status_code})"
+                        )
+                        return False
+                    status = resp.status_code
+            # Semaphore released and response closed: back off, then retry.
+            logging.info(
+                f"HTTP {status} for {url}; backing off {wait_s:.1f}s "
+                f"(retry {retry + 1}/{MAX_RETRIES})"
+            )
+            if not _interruptible_sleep(wait_s):
+                return False
+        return False
     except requests.exceptions.RequestException as e:
         logging.warning(f"Failed to download {url}: {e}")
         return False

@@ -26,3 +26,9 @@ Set it with `-t` / `--threads` (default 5):
 `python ./wordpress-rest-enum.py -i targets.txt -po -pa -u -m -dm -t 5`
 
 Use `-t 1` for fully sequential behaviour.
+
+## Rate limiting (HTTP 429)
+
+Both enumeration and downloads respect rate limiting. On an HTTP 429 (or 503) the tool honours the `Retry-After` header (seconds or HTTP-date form, capped at 120s) and retries, falling back to exponential backoff with jitter when no header is sent. It retries up to 5 times per request before giving up on that item. Backoff waits are interruptible with Ctrl-C.
+
+This matters for enumeration: a rate-limited page is retried rather than being mistaken for the end of the results, so pagination is not silently truncated.
